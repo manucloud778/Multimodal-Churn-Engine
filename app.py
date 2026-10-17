@@ -1,4 +1,5 @@
 import os
+import re
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -19,10 +20,39 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------
-# 1. NLTK Initialization
+# 1. NLTK Initialization & Churn Intent Lexicon
 # ---------------------------------------------------------
 nltk.download('vader_lexicon', quiet=True)
 sia = SentimentIntensityAnalyzer()
+
+# High-precision churn intent keywords & phrases
+CHURN_INTENT_PATTERNS = [
+    r'\bcancel\b', r'\bcancelling\b', r'\bcancellation\b',
+    r'\bswitch\b', r'\bswitching\b', r'\bcompetitor\b', r'\bcompetitors\b',
+    r'\bleave\b', r'\bleaving\b', r'\bquit\b', r'\bquitting\b', r'\bterminate\b',
+    r'\bdowntime\b', r'\bdrops?\b', r'\bdisconnections?\b', r'\bslow\b', r'\bbroken\b',
+    r'\boverpriced\b', r'\bexpensive\b', r'\bgoing up\b', r'\bhidden (fee|charge|cost)s?\b',
+    r'\bunhelpful\b', r'\bterrible\b', r'\bworst\b', r'\bdisappointed\b', r'\bhorrible\b',
+    r'\brude\b', r'\bscam\b', r'\brefund\b', r'\bworthless\b'
+]
+
+def analyze_text_intent_and_sentiment(text: str):
+    """Computes VADER sentiment and checks for explicit churn intent patterns."""
+    text_lower = text.lower()
+    scores = sia.polarity_scores(text)
+    
+    # Count intent pattern matches
+    matches = sum(1 for pattern in CHURN_INTENT_PATTERNS if re.search(pattern, text_lower))
+    has_churn_intent = matches > 0
+    
+    return {
+        'neg': scores['neg'],
+        'neu': scores['neu'],
+        'pos': scores['pos'],
+        'compound': scores['compound'],
+        'intent_matches': matches,
+        'has_churn_intent': has_churn_intent
+    }
 
 # ---------------------------------------------------------
 # 2. Data Processing & Model Training
@@ -40,14 +70,14 @@ def load_and_process_data():
     df = df.rename(columns={'tenure': 'Tenure'})
     
     neg_text = [
-        "Frequent downtime and slow speeds. Very frustrated!",
-        "Billing error again! Customer support was unhelpful.",
-        "Overpriced service with terrible connection drops."
+        "Frequent downtime and slow speeds. Very frustrated with service!",
+        "Billing error again! Customer support was completely unhelpful.",
+        "Overpriced service with terrible connection drops. I want to cancel."
     ]
     pos_text = [
         "Great service, everything is working perfectly!",
         "Inquired about upgrading my monthly plan.",
-        "Support team resolved my issue quickly."
+        "Support team resolved my issue quickly. Very happy!"
     ]
     
     np.random.seed(42)
@@ -55,11 +85,11 @@ def load_and_process_data():
         lambda x: np.random.choice(neg_text) if x == 1 else np.random.choice(pos_text)
     )
     
-    def get_sentiment(text):
-        scores = sia.polarity_scores(str(text))
-        return pd.Series([scores['neg'], scores['neu'], scores['pos'], scores['compound']])
+    def get_features(text):
+        res = analyze_text_intent_and_sentiment(str(text))
+        return pd.Series([res['neg'], res['neu'], res['pos'], res['compound']])
 
-    df[['text_neg', 'text_neu', 'text_pos', 'text_compound']] = df['Support_Ticket_Text'].apply(get_sentiment)
+    df[['text_neg', 'text_neu', 'text_pos', 'text_compound']] = df['Support_Ticket_Text'].apply(get_features)
     return df
 
 @st.cache_resource
@@ -70,7 +100,7 @@ def train_model(df):
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    scale_pos_weight = (len(y_train) - sum(y_train)) / sum(y_train)
+    scale_pos_weight = (len(y_train) - sum(y_train)) / max(sum(y_train), 1)
 
     model = xgb.XGBClassifier(
         n_estimators=100,
@@ -110,40 +140,55 @@ support_text_input = st.sidebar.text_area(
 
 run_button = st.sidebar.button("Run Risk & CLV Analysis")
 
-# Real-time Inference Pipeline
-sentiment_scores = sia.polarity_scores(support_text_input)
+# ---------------------------------------------------------
+# 5. Hybrid Multimodal Risk Calculation
+# ---------------------------------------------------------
+nlp_res = analyze_text_intent_and_sentiment(support_text_input)
 
 input_data = pd.DataFrame([{
     'Tenure': tenure_input,
     'MonthlyCharges': monthly_charges_input,
     'TotalCharges': total_charges_input,
-    'text_neg': sentiment_scores['neg'],
-    'text_neu': sentiment_scores['neu'],
-    'text_pos': sentiment_scores['pos'],
-    'text_compound': sentiment_scores['compound']
+    'text_neg': nlp_res['neg'],
+    'text_neu': nlp_res['neu'],
+    'text_pos': nlp_res['pos'],
+    'text_compound': nlp_res['compound']
 }])
 
-raw_prob = model.predict_proba(input_data[feature_cols])[0][1]
+# Raw model probability from XGBoost
+raw_xgb_prob = model.predict_proba(input_data[feature_cols])[0][1]
 
-# Calibrate churn probability based on sentiment & tenure factors
-if sentiment_scores['compound'] < -0.3 and tenure_input <= 12:
-    churn_prob = max(raw_prob, 0.84)
-elif sentiment_scores['compound'] > 0.3:
-    churn_prob = min(raw_prob, 0.18)
-else:
-    churn_prob = raw_prob
+# Systematic probability synthesis (XGBoost + NLP Intent + Sentiment Polarity)
+risk_score = raw_xgb_prob
 
-expected_remaining_months = tenure_input * (1 - churn_prob)
+# Adjust for Churn Intent Signals
+if nlp_res['has_churn_intent']:
+    intent_boost = 0.35 + (0.10 * (nlp_res['intent_matches'] - 1))
+    risk_score = min(0.98, max(risk_score + intent_boost, 0.82))
+
+# Adjust for strong negative sentiment without explicit intent keywords
+elif nlp_res['compound'] < -0.2:
+    risk_score = min(0.95, max(risk_score + 0.30, 0.75))
+
+# Adjust for loyal positive tenure customers
+elif nlp_res['compound'] > 0.2 and not nlp_res['has_churn_intent'] and tenure_input >= 12:
+    risk_score = max(0.02, min(risk_score * 0.3, 0.15))
+
+churn_prob = float(np.clip(risk_score, 0.001, 0.999))
+
+# Customer Lifetime Value Calculation
+remaining_months_factor = max(1, 12 - tenure_input) if tenure_input < 12 else 12
+expected_remaining_months = remaining_months_factor * (1.0 - churn_prob)
 estimated_clv = monthly_charges_input * expected_remaining_months
 
 # ---------------------------------------------------------
-# 5. Executive Metrics Row
+# 6. Executive Metrics Row
 # ---------------------------------------------------------
 col1, col2, col3 = st.columns(3)
 
 with col1:
     st.metric("Churn Risk Probability", f"{churn_prob * 100:.1f}%")
-    if churn_prob > 0.5:
+    if churn_prob > 0.50:
         st.error("Status: High Risk Customer")
     else:
         st.success("Status: Low Risk Customer")
@@ -152,29 +197,32 @@ with col2:
     st.metric("Estimated 12-Mo CLV", f"${estimated_clv:.2f}")
 
 with col3:
-    st.metric("Text Sentiment Compound", f"{sentiment_scores['compound']:.2f}")
+    st.metric("Text Sentiment Compound", f"{nlp_res['compound']:.2f}")
 
 st.markdown("---")
 
 # ---------------------------------------------------------
-# 6. SHAP Interpretability Section
+# 7. SHAP Interpretability Section
 # ---------------------------------------------------------
 st.subheader("🔍 SHAP Interpretability: Individual Feature Contributions")
 
 shap_values_instance = explainer(input_data[feature_cols])
 
+plt.close('all')
 fig, ax = plt.subplots(figsize=(10, 4))
 shap.plots.waterfall(shap_values_instance[0], show=False)
-st.pyplot(fig)
+st.pyplot(plt.gcf())
+plt.close('all')
 
 st.markdown("---")
 
 # ---------------------------------------------------------
-# 7. Global Feature Importance
+# 8. Global Feature Importance
 # ---------------------------------------------------------
 st.subheader("📈 Global Model Feature Importance")
 
 shap_values_global = explainer(X_test)
 fig_summary, ax_summary = plt.subplots(figsize=(10, 5))
 shap.summary_plot(shap_values_global, X_test, show=False)
-st.pyplot(fig_summary)
+st.pyplot(plt.gcf())
+plt.close('all')
